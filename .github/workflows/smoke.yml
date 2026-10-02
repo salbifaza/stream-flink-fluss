@@ -1,0 +1,30 @@
+name: Smoke Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stack and deploy Flink jobs
+        run: make up
+
+      - name: Verify pipeline end to end
+        run: make verify
+
+      - name: Show status and logs on failure
+        if: failure()
+        run: |
+          ./scripts/status.sh || true
+          docker compose logs --tail=80
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v

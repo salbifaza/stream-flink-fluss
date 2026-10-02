@@ -1,0 +1,199 @@
+name: stream-flink-fluss
+
+# Postgres --(Flink CDC)--> Fluss bronze --(Flink SQL)--> Fluss gold
+#                                 \                          /
+#                                  `--(Flink SQL $changelog)´--> ClickHouse
+#
+# Host ports avoid the common defaults (5432, 8123, 8081, 9000) so this
+# stack can run next to other local databases.
+
+x-fluss-remote: &fluss-remote
+  # Fluss uploads KV snapshots here, and Flink reads them back directly when
+  # it scans a primary-key table, so Fluss and Flink must share it.
+  fluss_remote:/opt/fluss-remote
+
+services:
+  # ── source ────────────────────────────────────────────────────────────────
+  source-postgres:
+    image: postgres:16.14-alpine
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+    environment:
+      POSTGRES_USER: ${SOURCE_PG_USER:-ecommerce}
+      POSTGRES_PASSWORD: ${SOURCE_PG_PASSWORD:-ecommerce}
+      POSTGRES_DB: ${SOURCE_PG_DB:-ecommerce}
+    ports:
+      - "5435:5432"
+    volumes:
+      - source_pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SOURCE_PG_USER:-ecommerce} -d ${SOURCE_PG_DB:-ecommerce}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Fluss: streaming storage (changelog + current state per table) ─────────
+  # Fluss keeps all cluster metadata here: which tables exist, their ids,
+  # buckets and leaders. It must be durable. Without a volume, `docker compose
+  # down` erases it, the CDC pipeline recreates every table on the next run,
+  # and log offsets restart at 0 (see clickhouse/init/01_tables.sql for what
+  # that does to the ClickHouse replicas).
+  zookeeper:
+    image: zookeeper:3.9.2
+    restart: unless-stopped
+    volumes:
+      - zookeeper_data:/data
+      - zookeeper_datalog:/datalog
+
+  # Named volumes are created root-owned; Fluss and Flink both run as uid
+  # 9999, so fix ownership once before either starts.
+  volume-init:
+    image: busybox
+    user: root
+    command: ["sh", "-c", "chown -R 9999:9999 /opt/fluss-remote /tmp/fluss /opt/flink/checkpoints"]
+    volumes:
+      - *fluss-remote
+      - fluss_tablet_data:/tmp/fluss
+      - flink_checkpoints:/opt/flink/checkpoints
+
+  fluss-coordinator:
+    image: apache/fluss:0.9.1-incubating
+    command: coordinatorServer
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_started
+      volume-init:
+        condition: service_completed_successfully
+    environment:
+      FLUSS_PROPERTIES: |
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://fluss-coordinator:9123
+        advertised.listeners: FLUSS://fluss-coordinator:9123
+        internal.listener.name: FLUSS
+        remote.data.dir: /opt/fluss-remote
+    volumes:
+      - *fluss-remote
+
+  fluss-tablet:
+    image: apache/fluss:0.9.1-incubating
+    command: tabletServer
+    restart: unless-stopped
+    depends_on:
+      fluss-coordinator:
+        condition: service_started
+    environment:
+      FLUSS_PROPERTIES: |
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://fluss-tablet:9123
+        advertised.listeners: FLUSS://fluss-tablet:9123
+        internal.listener.name: FLUSS
+        tablet-server.id: 0
+        data.dir: /tmp/fluss/data
+        remote.data.dir: /opt/fluss-remote
+        # Snapshot primary-key tables every minute instead of every 10, so a
+        # restarted Flink job replays less log on top of the last snapshot.
+        kv.snapshot.interval: 1min
+    volumes:
+      - fluss_tablet_data:/tmp/fluss
+      - *fluss-remote
+
+  # ── Flink: CDC pipeline, gold job, ClickHouse sink job ─────────────────────
+  flink-jobmanager:
+    build: ./flink
+    image: stream-flink-fluss:local
+    command: jobmanager
+    restart: unless-stopped
+    depends_on:
+      fluss-coordinator:
+        condition: service_started
+      volume-init:
+        condition: service_completed_successfully
+    environment:
+      SOURCE_PG_USER: ${SOURCE_PG_USER:-ecommerce}
+      SOURCE_PG_PASSWORD: ${SOURCE_PG_PASSWORD:-ecommerce}
+      SOURCE_PG_DB: ${SOURCE_PG_DB:-ecommerce}
+      CLICKHOUSE_SINK_USER: ${CLICKHOUSE_SINK_USER:-flink_sink}
+      CLICKHOUSE_SINK_PASSWORD: ${CLICKHOUSE_SINK_PASSWORD:-flink_sink_password}
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    ports:
+      - "8089:8081"
+    volumes:
+      - flink_checkpoints:/opt/flink/checkpoints
+      - *fluss-remote
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+
+  flink-taskmanager:
+    image: stream-flink-fluss:local
+    command: taskmanager
+    restart: unless-stopped
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        # 3 jobs at parallelism 1 (CDC pipeline, gold, ClickHouse sink),
+        # plus headroom for a restart overlapping a resubmit.
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 3072m
+        # Join and aggregate state lives on the JVM heap (hashmap backend),
+        # not in managed memory, so give the heap the room.
+        taskmanager.memory.managed.fraction: 0.1
+        # The Fluss client decodes Arrow record batches in direct memory, and
+        # Flink reserves none for tasks by default. Without this, replaying a
+        # few thousand changelog rows fails with "OutOfMemoryError: Direct
+        # buffer memory" in the Fluss source.
+        taskmanager.memory.task.off-heap.size: 256m
+    volumes:
+      - flink_checkpoints:/opt/flink/checkpoints
+      - *fluss-remote
+
+  # ── destination ───────────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8.24-alpine
+    restart: unless-stopped
+    environment:
+      # Bootstrap/admin identity: creates the tables and the sink user, and
+      # runs operator queries. The Flink sink never uses it.
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-ch_admin}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-ch_admin_password}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      CLICKHOUSE_SINK_USER: ${CLICKHOUSE_SINK_USER:-flink_sink}
+      CLICKHOUSE_SINK_PASSWORD: ${CLICKHOUSE_SINK_PASSWORD:-flink_sink_password}
+    ports:
+      - "8125:8123"
+      - "9011:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  source_pgdata:
+  zookeeper_data:
+  zookeeper_datalog:
+  fluss_remote:
+  fluss_tablet_data:
+  flink_checkpoints:
+  clickhouse_data:

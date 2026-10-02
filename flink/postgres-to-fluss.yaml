@@ -1,0 +1,40 @@
+################################################################################
+# Postgres -> Fluss CDC pipeline, submitted with flink-cdc.sh.
+#
+# One Flink job captures all six tables through one replication slot and
+# lands each in a Fluss primary-key table in database `bronze`, with UPDATEs
+# and DELETEs applied. Fluss then keeps both the current state and the full
+# changelog of every table, which is what the gold job and the ClickHouse
+# sink job read (flink/sql/).
+#
+# ${SOURCE_PG_*} placeholders are rendered by run-cdc-pipeline.sh, since
+# flink-cdc.sh has no variable substitution of its own.
+################################################################################
+source:
+  type: postgres
+  name: Postgres Source
+  hostname: source-postgres
+  port: 5432
+  username: ${SOURCE_PG_USER}
+  password: ${SOURCE_PG_PASSWORD}
+  tables: ${SOURCE_PG_DB}.public.(categories|customers|products|orders|order_items|payments)
+  decoding.plugin.name: pgoutput
+  slot.name: flink_cdc_slot
+  schema-change.enabled: true
+
+# The Postgres source emits (schema, table) ids, so `public.<table>` lands
+# in `bronze.<table>`.
+route:
+  - source-table: public.\.*
+    sink-table: bronze.<>
+    replace-symbol: <>
+    description: land every captured table in the bronze database
+
+sink:
+  type: fluss
+  name: Fluss Sink
+  bootstrap.servers: fluss-coordinator:9123
+
+pipeline:
+  name: postgres-to-fluss
+  parallelism: 1

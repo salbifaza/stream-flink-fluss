@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ClickHouse dialect for Flink's JDBC connector (flink-connector-jdbc-core 3.3).
+
+  The JDBC connector discovers dialects through the JdbcFactory SPI, matched on
+  the JDBC URL prefix. It ships dialects for MySQL, Postgres, Oracle and others,
+  but none for ClickHouse, and ClickHouse's own Flink connector is DataStream-only.
+  This module adds the missing piece so Flink SQL can write to
+  'jdbc:clickhouse://...' with the stock 'connector' = 'jdbc'.
+
+  Everything Flink-side is `provided`: the jar contains only these classes and
+  the SPI registration, and is dropped into /opt/flink/lib next to
+  flink-connector-jdbc-core and the ClickHouse JDBC driver.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>io.github.salbifaza</groupId>
+    <artifactId>flink-jdbc-clickhouse-dialect</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.release>11</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <flink.version>1.20.5</flink.version>
+        <flink.jdbc.version>3.3.0-1.20</flink.jdbc.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-jdbc-core</artifactId>
+            <version>${flink.jdbc.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-table-common</artifactId>
+            <version>${flink.version}</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>${project.artifactId}-${project.version}</finalName>
+    </build>
+</project>
