@@ -200,21 +200,34 @@ Three known Flink CDC 3.6 issues are also handled up front:
 checkpoint interval streaming never starts.
 → [All findings](docs/architecture.md#findings)
 
-## Why Fluss in the middle?
+## Do you actually need Fluss?
 
-Flink CDC could write straight to ClickHouse. Fluss in between costs two
-containers and a ZooKeeper, and buys:
+Not strictly. It does one specific job here: Flink SQL produces
+changelogs (inserts, update pairs, deletes, and constant retractions from
+the gold aggregates), and ClickHouse can't absorb those efficiently. Fluss's
+`$changelog` turns every change into an appended row with a change type and
+an ever-growing offset, which is exactly what `ReplacingMergeTree` needs. As
+far as I know, Flink 1.20 SQL has no built-in way to do that conversion, so
+Fluss is what keeps the whole pipeline in plain SQL with no custom Java.
 
-| | Without Fluss | With Fluss |
+| | Cost of Fluss | What it buys |
 |---|---|---|
-| **Replication slots** | One per consumer, each a WAL-retention risk on Postgres | One, however many consumers |
-| **Current state** | Only in the sink | Queryable in Fluss primary-key tables |
-| **Gold aggregates** | Need their own CDC read of Postgres | Read Fluss's changelog |
-| **Rebuilding a consumer** | Re-snapshot the production database | Replay from Fluss |
+| **Infrastructure** | 3 more containers (coordinator, tablet, ZooKeeper), ~540 MB RAM | One replication slot feeds both Flink jobs |
+| **Code** | None | Changelog → append rows for every table, with no custom code |
+| **Operations** | 2 of the 4 findings above came from Fluss | Consumers replay from Fluss, not the production database |
 
-Compared with Kafka + Debezium, Fluss stores tables rather than topics, so
-the gold job reads current state and changes from the same place, and the
-ClickHouse sink is one generic rule for every table.
+**Without it,** the cleanest design is one Flink job using Flink CDC's
+DataStream API: write each change event with its `op` field, and use the
+Postgres LSN as `_version`. That removes three containers, and the LSN is
+ordered globally, so finding 1 couldn't happen at all. The price is a few
+hundred lines of Java, including the code that turns gold retractions into
+rows. If all you need is a mirror, with gold recomputed on a schedule, a
+dedicated replication tool like PeerDB is simpler still.
+
+**Fluss earns its place when** more than one system consumes the change
+stream, when jobs need lookup joins against current state, when the data
+should also tier into a lakehouse such as Iceberg, or when consumers are
+rebuilt often enough that re-reading the production database hurts.
 
 ## What I'd change for production
 

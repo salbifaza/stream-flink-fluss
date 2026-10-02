@@ -29,17 +29,23 @@ Three Flink jobs, each at parallelism 1:
 
 ## Why Fluss sits in the middle
 
-Flink CDC could write straight to a sink. Putting Fluss between capture and
-everything else buys three things:
+The job Fluss does that is hard to replace: Flink emits changelogs with
+retractions, ClickHouse wants append-only rows, and a Fluss table's
+`$changelog` converts one into the other in plain SQL (next section). Flink
+1.20 SQL has no built-in equivalent that I know of. Two side benefits:
 
-- **One replication slot, many consumers.** The gold job and the ClickHouse
-  sink both read Fluss. Postgres serves exactly one reader, so there is one
-  slot's worth of retained WAL to watch, however many consumers are added.
-- **Current state and changelog in one place.** A Fluss primary-key table
-  answers "what is this row now" and "what changed, in order" from the same
-  table. The gold job reads the first form, the ClickHouse sink the second.
+- **One replication slot, two consumers.** The gold job and the ClickHouse
+  sink both read Fluss, so Postgres serves one reader and there is one slot's
+  worth of retained WAL to watch.
 - **Replay without touching Postgres.** A consumer that falls behind or is
   rebuilt reads from Fluss, not from the production database.
+
+The alternative without Fluss is a Flink DataStream job that reads Flink
+CDC's change events directly, writes each one with its `op` field, and uses
+the Postgres LSN as `_version`. The LSN is ordered globally, which would make
+[finding 1](#1-log-offsets-restart-when-a-fluss-table-is-recreated)
+impossible. The cost is custom Java for the bronze rows and for turning gold
+retractions into rows, in exchange for three fewer containers.
 
 ## Turning a changelog into ClickHouse rows
 
